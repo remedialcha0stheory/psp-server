@@ -86,6 +86,7 @@ public:
             mp.erase(newnode->offset);
             mp[offset] = newnode;
             newnode->offset = offset;
+            newnode->valid_bytes = valid_bytes;
             // COPY the data!
             memcpy(newnode->buf, data, 1024);
             newnode->prevnode->nextnode = tail;
@@ -447,7 +448,7 @@ void distributeInitialChunks(){
 }
 
 int main(){
-    N_CLIENTS = 5;
+    N_CLIENTS = 50;
     cache = new LRUCache(N_CLIENTS);
     // when clients first connect with server and receive their starting chunks, they must also tell their udp listening ports for broadcast. 
     cout<<"Starting server.."<<endl;
