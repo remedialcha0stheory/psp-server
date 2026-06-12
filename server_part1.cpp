@@ -337,14 +337,19 @@ void worker(int offset, in_addr client_ip, int client_tcp_port){
         setsockopt(reply_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&recv_timeout_ms, sizeof(recv_timeout_ms));
 
         // char buf[1024] = {0}; // Guarantee null-terminators
-        int bytes_received = recv(reply_socket, (char*)&packet, sizeof(packet), 0);
+        int bytes_received = 0;
+        while (bytes_received < sizeof(packet)) {
+            int received = recv(reply_socket, ((char*)&packet) + bytes_received, sizeof(packet) - bytes_received, 0);
+            if (received <= 0) break;
+            bytes_received += received;
+        }
 
-        if (bytes_received <= 0) {
-            std::cout << "Error: Peer connected but dropped the Wi-Fi. "<< WSAGetLastError() << std::endl;
+        if (bytes_received < sizeof(packet)) {
+            // The sister thread dropped the connection. Abort before poisoning the cache!
             closesocket(reply_socket);
             closesocket(reply_listening_socket);
             closesocket(broadcast_socket);
-            return; // Kill the thread safely
+            return; 
         }
         // ----------------------------------------------------------------------------- Gemini code ends
 
