@@ -8,8 +8,8 @@
 using namespace std;
 
 int N_CLIENTS;
-const char* SERVER_IP = "192.168.1.3";
-mutex mu;
+const char* SERVER_IP = "192.168.1.6";
+int done = 0;
 
 struct FileChunkPacket{
     int index;
@@ -88,6 +88,42 @@ void printErrorMessage(int bytes_received){
     }
 }
 
+// DEALBREAKER!!! SCALED THE ARCHITECTURE BY A LOT!!!! earlier i was handling broadcast replies inside the sister thread only
+// detaching another sister thread was the dealbreaker here!
+
+void broadcast_reply(int index, string filename, int reply_port, mutex& mu){
+    FileChunkPacket packet;
+            packet.index = index;
+            memset(packet.data, 0, 1024);
+            mu.lock();
+            ifstream infile(filename, ios::binary);
+            infile.seekg(index*1024ULL);
+            infile.read(packet.data, 1024);
+            packet.valid_bytes = infile.gcount();
+            infile.close();
+            mu.unlock();
+
+            sockaddr_in server_addr{};
+            server_addr.sin_family = AF_INET;
+            server_addr.sin_port = htons(reply_port);
+            server_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
+
+            SOCKET broadcast_reply_socket = socket(AF_INET, SOCK_STREAM, 0);
+            int connection_result = connect(broadcast_reply_socket, (sockaddr*)&server_addr, sizeof(server_addr));
+            if(connection_result==SOCKET_ERROR){
+                closesocket(broadcast_reply_socket);
+                return;
+            }
+
+            int sent_bytes = 0;
+            while(sent_bytes < sizeof(packet)){
+                int sent = send(broadcast_reply_socket, ((char*)&packet)+sent_bytes, sizeof(packet)-sent_bytes, 0);
+                if(sent <= 0) break;
+                sent_bytes += sent;
+            }
+            closesocket(broadcast_reply_socket);
+}
+
 void sister_thread(SOCKET sister_udp_listening_socket, string filename, bool *chunk_tracker, mutex& mu){
     while(true){
         char buf[1024] = {0};
@@ -109,36 +145,7 @@ void sister_thread(SOCKET sister_udp_listening_socket, string filename, bool *ch
         bool found = chunk_tracker[index];
         mu.unlock();
         if(found){
-            FileChunkPacket packet;
-            packet.index = index;
-            memset(packet.data, 0, 1024);
-            mu.lock();
-            ifstream infile(filename, ios::binary);
-            infile.seekg(index*1024ULL);
-            infile.read(packet.data, 1024);
-            packet.valid_bytes = infile.gcount();
-            infile.close();
-            mu.unlock();
-
-            sockaddr_in server_addr{};
-            server_addr.sin_family = AF_INET;
-            server_addr.sin_port = htons(reply_port);
-            server_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
-
-            SOCKET broadcast_reply_socket = socket(AF_INET, SOCK_STREAM, 0);
-            int connection_result = connect(broadcast_reply_socket, (sockaddr*)&server_addr, sizeof(server_addr));
-            if(connection_result==SOCKET_ERROR){
-                closesocket(broadcast_reply_socket);
-                continue;
-            }
-
-            int sent_bytes = 0;
-            while(sent_bytes < sizeof(packet)){
-                int sent = send(broadcast_reply_socket, ((char*)&packet)+sent_bytes, sizeof(packet)-sent_bytes, 0);
-                if(sent <= 0) break;
-                sent_bytes += sent;
-            }
-            closesocket(broadcast_reply_socket);
+            thread(broadcast_reply, index, filename, reply_port, ref(mu)).detach();
         }
         else{
             continue;
@@ -381,6 +388,18 @@ void worker(int client_id){
             if(bytes <= 0) break;
             bytes_received += bytes;
         }
+        if (bytes_received < sizeof(packet)) {
+            mu.lock();
+            cout << "Partial network drop on chunk " << i % total_chunks << ". Rejecting and retrying..." << endl;
+            mu.unlock();
+            
+            closesocket(tcp_data_socket);
+            closesocket(tcp_data_socket_listener);
+            
+            i--; // Force the loop to retry this exact chunk
+            Sleep(500); // Breathe, then ask again
+            continue;
+        }
         mu.lock();
         std::fstream outfile(filename, std::ios::in | std::ios::out | std::ios::binary);
         outfile.seekp(packet.index*1024ULL);
@@ -395,7 +414,7 @@ void worker(int client_id){
     cout<<"client "<<client_id<<" DONE!"<<endl;
     string REQUEST_MSG = "DONE";
     sendto(main_request_socket, REQUEST_MSG.c_str(), REQUEST_MSG.size(), 0, (sockaddr*)&server_listening_addr, sizeof(server_listening_addr));
-
+    done++;
     sister.join();
     
     closesocket(main_request_socket);
@@ -408,7 +427,7 @@ int main(){
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    N_CLIENTS = 5;
+    N_CLIENTS = 20;
     vector <thread> clients;
     for(int i=0; i<N_CLIENTS; i++){
         clients.emplace_back(worker, i);
@@ -416,6 +435,6 @@ int main(){
     for(int i=0; i<N_CLIENTS; i++){
         clients[i].join();
     }
-
+    cout<<done<<" clients DONE!"<<endl;
     WSACleanup();
 }
