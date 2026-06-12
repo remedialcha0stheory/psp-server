@@ -8,7 +8,7 @@
 using namespace std;
 
 int N_CLIENTS;
-const char* SERVER_IP = "192.168.1.6";
+const char* SERVER_IP = "192.168.1.3";
 int done = 0;
 
 struct FileChunkPacket{
@@ -388,18 +388,6 @@ void worker(int client_id){
             if(bytes <= 0) break;
             bytes_received += bytes;
         }
-        if (bytes_received < sizeof(packet)) {
-            mu.lock();
-            cout << "Partial network drop on chunk " << i % total_chunks << ". Rejecting and retrying..." << endl;
-            mu.unlock();
-            
-            closesocket(tcp_data_socket);
-            closesocket(tcp_data_socket_listener);
-            
-            i--; // Force the loop to retry this exact chunk
-            Sleep(500); // Breathe, then ask again
-            continue;
-        }
         mu.lock();
         std::fstream outfile(filename, std::ios::in | std::ios::out | std::ios::binary);
         outfile.seekp(packet.index*1024ULL);
@@ -427,7 +415,7 @@ int main(){
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    N_CLIENTS = 20;
+    N_CLIENTS = 50;
     vector <thread> clients;
     for(int i=0; i<N_CLIENTS; i++){
         clients.emplace_back(worker, i);
