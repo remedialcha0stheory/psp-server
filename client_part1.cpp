@@ -106,15 +106,19 @@ void sister_thread(SOCKET sister_udp_listening_socket, string filename, bool *ch
         sscanf(buf, "CHUNK: %d REPLY_PORT: %d", &index, &reply_port);
 
         mu.lock();
-        if(chunk_tracker[index]){
-            ifstream infile(filename, ios::binary);
+        bool found = chunk_tracker[index];
+        mu.unlock();
+        if(found){
             FileChunkPacket packet;
             packet.index = index;
             memset(packet.data, 0, 1024);
+            mu.lock();
+            ifstream infile(filename, ios::binary);
             infile.seekg(index*1024ULL);
             infile.read(packet.data, 1024);
             packet.valid_bytes = infile.gcount();
             infile.close();
+            mu.unlock();
 
             sockaddr_in server_addr{};
             server_addr.sin_family = AF_INET;
@@ -124,7 +128,6 @@ void sister_thread(SOCKET sister_udp_listening_socket, string filename, bool *ch
             SOCKET broadcast_reply_socket = socket(AF_INET, SOCK_STREAM, 0);
             int connection_result = connect(broadcast_reply_socket, (sockaddr*)&server_addr, sizeof(server_addr));
             if(connection_result==SOCKET_ERROR){
-                mu.unlock();
                 closesocket(broadcast_reply_socket);
                 continue;
             }
@@ -138,10 +141,8 @@ void sister_thread(SOCKET sister_udp_listening_socket, string filename, bool *ch
             closesocket(broadcast_reply_socket);
         }
         else{
-            mu.unlock();
             continue;
         }
-        mu.unlock();
     }
 }
 
@@ -150,6 +151,7 @@ void worker(int client_id){
     string filename = "client_" + std::to_string(client_id) + "_output.txt";
     ofstream create_file(filename, ios::binary);
     create_file.close();
+    cout<<"Created client with id: "<<client_id<<endl;
 
     int total_chunks;
     SOCKET main_request_socket = socket(AF_INET, SOCK_DGRAM, 0); // sends the hello
@@ -159,8 +161,8 @@ void worker(int client_id){
     DWORD initial_tcp_socket_timeout = 2000;
     setsockopt(initial_tcp_socket, SOL_SOCKET, SO_RCVTIMEO, (char*)&initial_tcp_socket_timeout, sizeof(initial_tcp_socket_timeout));
     SOCKET sister_udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
-    DWORD sister_udp_timeout = 60000;
-    setsockopt(sister_udp_socket, SOL_SOCKET, SO_RCVTIMEO, (char*)&sister_udp_timeout, sizeof(sister_udp_timeout));
+    DWORD sister_udp_timeout = 180000; // should be 60000
+    // setsockopt(sister_udp_socket, SOL_SOCKET, SO_RCVTIMEO, (char*)&sister_udp_timeout, sizeof(sister_udp_timeout));
     int initial_tcp_port;
     int sister_udp_port;
 
@@ -190,6 +192,8 @@ void worker(int client_id){
 
     listen(initial_tcp_socket, 5);
 
+    cout<<"Sending HELLO message"<<endl;
+
     string HELLO_MSG = "HELLO, UDP: " + to_string(sister_udp_port) + ", TCP: " + to_string(initial_tcp_port);
     int sent_bytes = sendto(main_request_socket, HELLO_MSG.c_str(), HELLO_MSG.size(), 0, (sockaddr*)&server_listening_addr, sizeof(server_listening_addr));
     if(sent_bytes <= 0){
@@ -206,7 +210,8 @@ void worker(int client_id){
     // setsockopt doesnt work on accept, it works for recv timeouts. so accept still needs the select() func
 
     int my_chunks;
-    int total_chunks;
+    total_chunks;
+    // cout<<"Receiving chunks count"<<endl;
     SOCKET initial_tcp_socket_accepted = acceptWithTimeout(initial_tcp_socket, 60);
     if(initial_tcp_socket_accepted==INVALID_SOCKET){
         closesocket(initial_tcp_socket);
@@ -216,16 +221,23 @@ void worker(int client_id){
         return;
     }
     char buf[1024] = {0};
-    int bytes_received = recv(initial_tcp_socket_accepted, buf, sizeof(buf)-1, 0);
-    if(bytes_received<=0){
-        printErrorMessage(bytes_received);
-        closesocket(initial_tcp_socket);
-        closesocket(initial_tcp_socket_accepted);
-        closesocket(main_request_socket);
-        closesocket(sister_udp_socket);
-        return;
+    char ticket_buf[128] = {0};
+    int bytes_received = 0;
+    while(bytes_received < 128){
+        int received = recv(initial_tcp_socket_accepted, ticket_buf+bytes_received, 128-bytes_received, 0);
+        if(received == 0) break;
+        if(received < 0){
+            printErrorMessage(bytes_received);
+            closesocket(initial_tcp_socket);
+            closesocket(initial_tcp_socket_accepted);
+            closesocket(main_request_socket);
+            closesocket(sister_udp_socket);
+            return;
+        }
+        bytes_received += received;
     }
-    sscanf(buf, "TOTAL_CHUNKS: %d YOUR_CHUNKS: %d", &total_chunks, &my_chunks);
+    
+    sscanf(ticket_buf, "TOTAL_CHUNKS: %d YOUR_CHUNKS: %d", &total_chunks, &my_chunks);
 
     bool chunk_tracker[100000];
     memset(chunk_tracker, false, 100000);
@@ -233,16 +245,26 @@ void worker(int client_id){
     thread sister(sister_thread, sister_udp_socket, filename, chunk_tracker, ref(mu));
 
     int chunks_received = 0;
+
+    // cout<<"client id: "<<client_id<<" total chunks "<<total_chunks<<" my chunks "<<my_chunks<<endl;
+
+    if(client_id==0) cout<<"Starting chunks loop"<<endl;
     while(chunks_received<my_chunks){
         FileChunkPacket packet;
         memset(packet.data, 0, 1024);
         packet.index = 0;
         packet.valid_bytes = 0;
         bytes_received = 0;
+        if(client_id==0) cout<<"client id: "<<client_id<<" chunks received: "<<chunks_received<<endl;
         while(bytes_received<sizeof(packet)){
+            // if(client_id==0) cout<<"client id: "<<client_id<<" bytes received: "<<bytes_received<<endl;
             int received = recv(initial_tcp_socket_accepted, ((char*)&packet)+bytes_received, sizeof(packet)-bytes_received, 0);
+            // if(client_id==0) cout<<"client id: "<<client_id<<" received: "<<received<<endl;
             if(received ==0) break;
             if(received < 0){
+                mu.lock();
+                cout<<"client id: "<<client_id<<" returning early!"<<endl;
+                mu.unlock();
                 printErrorMessage(received);
                 closesocket(initial_tcp_socket);
                 closesocket(initial_tcp_socket_accepted);
@@ -253,6 +275,7 @@ void worker(int client_id){
             }
             bytes_received += received;
         }
+        if(client_id==0) cout<<"client id: "<<client_id<<" loop finished: "<<packet.index<<endl;
         mu.lock();
         std::fstream outfile(filename, std::ios::in | std::ios::out | std::ios::binary);
         outfile.seekp(packet.index*1024ULL);
@@ -261,8 +284,15 @@ void worker(int client_id){
         outfile.close();
         mu.unlock();
 
+        if(client_id==0) cout<<"client id: "<<client_id<<" received chunk: "<<packet.index<<endl;
+
         chunks_received++;
     }
+    cout<<"client "<<client_id<<" sending RECEIVED_ALL message."<<endl;
+    const char* RECEIVED_ALL_MSG = "RECEIVED_ALL";
+    sent_bytes = sendto(main_request_socket, RECEIVED_ALL_MSG, strlen(RECEIVED_ALL_MSG), 0, (sockaddr*)&server_listening_addr, sizeof(server_listening_addr));
+
+    cout<<"client "<<client_id<<" expecting sync complete"<<endl;
     memset(buf, 0, 1024);
     bytes_received = recvfrom(main_request_socket, buf, sizeof(buf)-1, 0, NULL, NULL);
     if(bytes_received < 0){
@@ -271,6 +301,7 @@ void worker(int client_id){
             bytes_received = recvfrom(main_request_socket, buf, sizeof(buf)-1, 0, NULL, NULL);
         }
         else{
+            cout<<"yo dude"<<endl;
             printErrorMessage(bytes_received);
             closesocket(initial_tcp_socket);
             closesocket(initial_tcp_socket_accepted);
@@ -289,6 +320,7 @@ void worker(int client_id){
         sister.join();
         return;
     }
+    cout<<"client "<<client_id<<" received SYNC_COMPLETE"<<endl;
 
     DWORD timeout_tcp_data_socket = 2000;
     for(int i=0; i<2*total_chunks; i++){
@@ -309,6 +341,9 @@ void worker(int client_id){
         getsockname(tcp_data_socket_listener, (sockaddr*)&myaddress, &socklen);
         listen(tcp_data_socket_listener, 5);
         string REQUEST_MSG = "CHUNK: "+to_string(i%total_chunks)+", TCP: "+to_string(ntohs(myaddress.sin_port));
+        mu.lock();
+        cout<<"client : "<<client_id<<" "<<REQUEST_MSG<<endl;
+        mu.unlock();
         
         sent_bytes = sendto(main_request_socket, REQUEST_MSG.c_str(), REQUEST_MSG.size(), 0, (sockaddr*)&server_listening_addr, sizeof(server_listening_addr));
         if(sent_bytes < 0){
@@ -330,10 +365,12 @@ void worker(int client_id){
             }
         }
 
-        SOCKET tcp_data_socket = acceptWithTimeout(tcp_data_socket_listener, 1);
+        SOCKET tcp_data_socket = acceptWithTimeout(tcp_data_socket_listener, 5);
         if(tcp_data_socket==INVALID_SOCKET){
             cout<<"Invalid socket on request for chunk: "<<i%total_chunks<<endl;
             closesocket(tcp_data_socket_listener);
+            i--;
+            Sleep(500);
             continue;
         }
         setsockopt(tcp_data_socket, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout_tcp_data_socket, sizeof(timeout_tcp_data_socket));
@@ -353,7 +390,9 @@ void worker(int client_id){
         mu.unlock();
         closesocket(tcp_data_socket);
         closesocket(tcp_data_socket_listener);
+        cout<<"client "<<client_id<<"'s request for chunk "<<(i%total_chunks)<<" completed!"<<endl;
     }
+    cout<<"client "<<client_id<<" DONE!"<<endl;
     string REQUEST_MSG = "DONE";
     sendto(main_request_socket, REQUEST_MSG.c_str(), REQUEST_MSG.size(), 0, (sockaddr*)&server_listening_addr, sizeof(server_listening_addr));
 
