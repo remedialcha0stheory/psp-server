@@ -13,6 +13,12 @@ mutex mu;
 // if the mu is already locked. it doesnt matter if theyre looking at different lines of code. its just a global
 // pass flag.
 
+struct FileChunkPacket{
+    int index;
+    char data[1024];
+    int valid_bytes;
+};
+
 struct DLLNode{
     char buf[1024];
     int offset;
@@ -234,7 +240,7 @@ set <pair <uint32_t, int>> clients_main_udp_ports;
 void worker(int offset, in_addr client_ip, int client_tcp_port){
     // since chunk requests come by udp, the server will have to initiate the tcp connection
     // with the client. 
-    cout<<"Sending offset "<<offset<<" to client port "<<client_tcp_port<<endl;
+    
     FileChunkPacket packet;
     packet.index = offset;
     mu.lock();
@@ -254,7 +260,7 @@ void worker(int offset, in_addr client_ip, int client_tcp_port){
         client_addr.sin_addr = client_ip;
 
         // should i start a tcp connection first and then look into the cache or first look in cache and then start connection?
-
+        cout<<"CACHE HIT. Sending offset "<<offset<<" to client port "<<client_tcp_port<<endl;
         connect(tcp_socket, (sockaddr*) &client_addr, sizeof(client_addr));
 
         send(tcp_socket, (char*)&packet, sizeof(packet), 0);
@@ -302,7 +308,7 @@ void worker(int offset, in_addr client_ip, int client_tcp_port){
         FD_SET(reply_listening_socket, &readfds);   // Put our socket in the sockets array
 
         timeval timeout;
-        timeout.tv_sec = 2;                         // Set timer to 2 seconds
+        timeout.tv_sec = 5;                         // Set timer to 2 seconds
         timeout.tv_usec = 0;
 
         // select() puts the thread to sleep for exactly 2 seconds.
@@ -334,7 +340,7 @@ void worker(int offset, in_addr client_ip, int client_tcp_port){
         int bytes_received = recv(reply_socket, (char*)&packet, sizeof(packet), 0);
 
         if (bytes_received <= 0) {
-            std::cout << "Error: Peer connected but dropped the Wi-Fi." << std::endl;
+            std::cout << "Error: Peer connected but dropped the Wi-Fi. "<< WSAGetLastError() << std::endl;
             closesocket(reply_socket);
             closesocket(reply_listening_socket);
             closesocket(broadcast_socket);
@@ -354,7 +360,7 @@ void worker(int offset, in_addr client_ip, int client_tcp_port){
         client_addr.sin_addr = client_ip;
 
         // should i start a tcp connection first and then look into the cache or first look in cache and then start connection?
-
+        cout<<"CACHE MISS. Sending offset "<<offset<<" to client port "<<client_tcp_port<<endl;
         connect(tcp_socket, (sockaddr*) &client_addr, sizeof(client_addr));
 
         send(tcp_socket, (char*)&packet, sizeof(packet), 0);
@@ -366,11 +372,7 @@ void worker(int offset, in_addr client_ip, int client_tcp_port){
     }
 }
 
-struct FileChunkPacket{
-    int index;
-    char data[1024];
-    int valid_bytes;
-};
+
 
 // this phenomenon called endianness - is for every integer that goes over a network, either port and ip
 // in packet headers, or itnegers in the payload.
@@ -400,8 +402,19 @@ void distributeInitialChunks(){
         connect(distributor_socket, (sockaddr*)&client_addr, sizeof(client_addr));
 
         // MOST IMPORTANT !!!!!!!!!!!!!!!!!!!! ------------------------------------------------------
-        string TICKET_MSG = "TOTAL_CHUNKS: " + to_string(total_chunks) + " YOUR_CHUNKS: " + to_string(chunks_for_this_client);
-        send(distributor_socket, TICKET_MSG.c_str(), TICKET_MSG.size(), 0);
+        /* 
+        this is super important, udp messages have strict message boundaries, tcp doesnt, the message lengths can be arbitrary.
+        therefore you cant send this ticket message directly, you need to pad it safely inside a fixed sized 128 bytes buffer 
+        and read at the client side exactly like it. a fixed protocol.
+        */
+        char TICKET_MSG[128] = {0};
+        sprintf(TICKET_MSG, "TOTAL_CHUNKS: %d YOUR_CHUNKS: %d", total_chunks, chunks_for_this_client);
+        int sent_bytes = 0;
+        while(sent_bytes < 128){
+            int sent = send(distributor_socket, TICKET_MSG+sent_bytes, 128-sent_bytes, 0);
+            if(sent <= 0) break;
+            sent_bytes += sent;
+        }
 
         for(int i=0; i<chunks_for_this_client; i++){
             FileChunkPacket packet;
@@ -432,7 +445,7 @@ int main(){
     N_CLIENTS = 5;
     cache = new LRUCache(N_CLIENTS);
     // when clients first connect with server and receive their starting chunks, they must also tell their udp listening ports for broadcast. 
-
+    cout<<"Starting server.."<<endl;
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
@@ -465,6 +478,16 @@ int main(){
     }
 
     distributeInitialChunks();
+
+    cout<<"expecting RECEIVED_ALL messages"<<endl;
+    curr_clients = 0;
+    while(curr_clients<N_CLIENTS){
+        char buf[1024] = {0};
+        int bytes = recvfrom(main_listening_socket, buf, sizeof(buf)-1, 0, NULL, NULL);
+        if(bytes <=0 ) continue;
+        if(!strcmp(buf, "RECEIVED_ALL")) curr_clients++;
+    }
+    cout<<"received RECEIVED_ALL messages"<<endl;
 
     // needed if clients start transmitting requests and their duplicates in case of timeouts while server
     // was still distributing:
